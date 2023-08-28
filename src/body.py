@@ -210,6 +210,6 @@ if __name__ == "__main__":
     test_image = '../images/ski.jpg'
     oriImg = cv2.imread(test_image)  # B,G,R order
     candidate, subset = body_estimation(oriImg)
-    canvas = util.draw_bodypose(oriImg, candidate, subset)
-    plt.imshow(canvas[:, :, [2, 1, 0]])
+    canvas = util.draw_bodypose(oriImg[:, :, ::-1], candidate, subset)
+    plt.imshow(canvas)
     plt.show()
