@@ -20,6 +20,13 @@ def make_layers(name_spec_list, no_relu_layers):
                 layers.append(('relu_'+name, nn.ReLU(inplace=True)))
     return nn.Sequential(OrderedDict(layers))
 
+def loss_func(paf, heatmap, label):
+    Cp, Ch = paf.shape[1], heatmap.shape[1]
+    if label is None:
+        return torch.zeros(Cp+Ch, dtype=paf.dtype, device=paf.device)
+     # TODO: render paf and heatmap labels
+    return torch.zeros(Cp+Ch, dtype=paf.dtype, device=paf.device)
+
 class bodypose_model(nn.Module):
     def __init__(self):
         super(bodypose_model, self).__init__()
@@ -84,35 +91,43 @@ class bodypose_model(nn.Module):
                 (f'Mconv6_stage{b}_L2', [128, 128, 1, 1, 0]),
                 (f'Mconv7_stage{b}_L2', [128,  19, 1, 1, 0])], no_relu_layers))
 
-    def forward(self, x):
+    def forward(self, img, label):
 
-        out0 = self.stage0(x)
+        out0 = self.stage0(img)
 
         out1_1 = self.stage1_1(out0)
         out1_2 = self.stage1_2(out0)
         out1 = torch.cat([out1_1, out1_2, out0], 1)
+        loss = loss_func(out1_1, out1_2, label)
 
         out2_1 = self.stage2_1(out1)
         out2_2 = self.stage2_2(out1)
         out2 = torch.cat([out2_1, out2_2, out0], 1)
+        loss += loss_func(out2_1, out2_2, label)
 
         out3_1 = self.stage3_1(out2)
         out3_2 = self.stage3_2(out2)
         out3 = torch.cat([out3_1, out3_2, out0], 1)
+        loss += loss_func(out3_1, out3_2, label)
 
         out4_1 = self.stage4_1(out3)
         out4_2 = self.stage4_2(out3)
         out4 = torch.cat([out4_1, out4_2, out0], 1)
+        loss += loss_func(out4_1, out4_2, label)
 
         out5_1 = self.stage5_1(out4)
         out5_2 = self.stage5_2(out4)
         out5 = torch.cat([out5_1, out5_2, out0], 1)
+        loss += loss_func(out5_1, out5_2, label)
 
         out6_1 = self.stage6_1(out5)
         out6_2 = self.stage6_2(out5)
         out6 = torch.cat([out6_1, out6_2], 1)
+        loss += loss_func(out6_1, out6_2, label)
 
-        return out6
+        loss /= 6
+
+        return out6, loss
 
 # transfer caffe model layer names to new names defined in model.py
 def transfer(model_weights, new_names):

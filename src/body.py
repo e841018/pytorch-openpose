@@ -4,49 +4,47 @@ from . import util, model
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-class Body(object):
+class Body:
     def __init__(self, model_path):
         self.model = model.bodypose_model().to(device)
         model_weights = torch.load(model_path, map_location=device)
         state_dict = model.transfer(model_weights, self.model.state_dict().keys())
         self.model.load_state_dict(state_dict)
-        self.model.eval()
 
-    def infer(self, img0, scales=[0.7, 1.0, 1.3]):
+    def infer(self, img0, label, base_height=368, scale=1.0):
+        # check shape
         B, C, H0, W0 = img0.shape
         assert img0.dtype == torch.float32
-
         # the model has 3 nn.MaxPool2d(stride=2) layers
         stride = 2 ** 3
-
+        # scale
+        H1 = int(scale * base_height)
+        W1 = int(W0 * H1 / H0)
+        img1 = TF.resize(img0, (H1, W1), interpolation=T.InterpolationMode.BICUBIC)
+        # pad
+        img2 = torch.nn.functional.pad(img1, (0, -W1%stride, 0, -H1%stride), value=0.5)
+        H2, W2 = img2.shape[-2:]
+        # main model, downsampling in the nn.MaxPool2d layers
+        out6, loss = self.model(img2, label) # out6.shape[-2:]=(H2/stride, W2/stride)
+        # undo downsampling
+        out6 = TF.resize(out6, (H2, W2), interpolation=T.InterpolationMode.BICUBIC)
+        # unpad
+        out6 = out6[:, :, :H1, :W1]
+        # undo scale
+        out6 = TF.resize(out6, (H0, W0), interpolation=T.InterpolationMode.BICUBIC)
+        return out6
+    
+    def split_out6(self, out6):
         n_channel = util.n_limb*2 + util.n_keypoint + 1
-        out6_mean = torch.zeros((B, n_channel, H0, W0), dtype=torch.float32, device=img0.device)
-        n_scale = len(scales)
-        for scale in scales:
-            # scale
-            H1 = int(scale * 368)
-            W1 = int(H1 / H0 * W0)
-            img1 = TF.resize(img0, (H1, W1), interpolation=T.InterpolationMode.BICUBIC)
-            # pad
-            img2 = torch.nn.functional.pad(img1, (0, -W1%stride, 0, -H1%stride), value=0.5)
-            H2, W2 = img2.shape[-2:]
-            # main model
-            out6 = self.model(img2) # shape=(B, n_channel, H2/stride, W2/stride)
-            # undo nn.MaxPool2d downsampling
-            out6 = TF.resize(out6, (H2, W2), interpolation=T.InterpolationMode.BICUBIC)
-            # unpad
-            out6 = out6[:, :, :H1, :W1]
-            # undo scale
-            out6 = TF.resize(out6, (H0, W0), interpolation=T.InterpolationMode.BICUBIC)
-            out6_mean += out6
-        out6_mean /= n_scale
+        B, C, H, W = out6.shape
+        assert C == n_channel, C
         paf = out6[:, :util.n_limb*2]
         heatmap = out6[:, util.n_limb*2:-1]
         # the last heatmap channel is background, not used here
         # https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/80d4c5f7b25ba4c3bf5745ab7d0e6ccd3db8b242/src/openpose/pose/poseParameters.cpp#L54
         return paf, heatmap
 
-    def __call__(self, img, sigma=3.0, thre1=0.1, n_linspace=10, thre2=0.05):
+    def __call__(self, img, label=None, scales=[0.7, 1.0, 1.3], sigma=3.0, thre1=0.1, n_linspace=10, thre2=0.05):
 
         ## check shape
         H, W, C = img.shape
@@ -57,8 +55,11 @@ class Body(object):
         img = img.moveaxis(-1, 0)[None, :, :, :]
 
         ## tensor operations
+        self.model.eval()
         with torch.no_grad():
-            paf, heatmap = self.infer(img)
+            out6s = [self.infer(img, label, scale=scale)[None] for scale in scales]
+            out6 = torch.cat(out6s).mean(axis=0)
+            paf, heatmap = self.split_out6(out6)
             heatmap_blur = TF.gaussian_blur(heatmap,
                 kernel_size=int(np.ceil(sigma * 4)) * 2 + 1,
                 sigma=sigma)
