@@ -1,215 +1,221 @@
-import cv2
-import numpy as np
-import math
-from scipy.ndimage.filters import gaussian_filter
-import matplotlib.pyplot as plt
-import torch
+import numpy as np, torch
+import torchvision.transforms as T, torchvision.transforms.functional as TF
+from . import util, model
 
-from . import util
-from .model import bodypose_model
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 class Body(object):
     def __init__(self, model_path):
-        self.model = bodypose_model()
-        if torch.cuda.is_available():
-            self.model = self.model.cuda()
-        model_dict = util.transfer(self.model, torch.load(model_path))
-        self.model.load_state_dict(model_dict)
+        self.model = model.bodypose_model().to(device)
+        model_weights = torch.load(model_path, map_location=device)
+        state_dict = model.transfer(model_weights, self.model.state_dict().keys())
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
-    def __call__(self, oriImg):
-        # scale_search = [0.5, 1.0, 1.5, 2.0]
-        scale_search = [0.5]
-        boxsize = 368
-        stride = 8
-        padValue = 128
-        thre1 = 0.1
-        thre2 = 0.05
-        multiplier = [x * boxsize / oriImg.shape[0] for x in scale_search]
-        heatmap_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 19))
-        paf_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 38))
+    def infer(self, img0, scales=[0.7, 1.0, 1.3]):
+        B, C, H0, W0 = img0.shape
+        assert img0.dtype == torch.float32
 
-        for m in range(len(multiplier)):
-            scale = multiplier[m]
-            imageToTest = cv2.resize(oriImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-            imageToTest_padded, pad = util.padRightDownCorner(imageToTest, stride, padValue)
-            im = np.transpose(np.float32(imageToTest_padded[:, :, :, np.newaxis]), (3, 2, 0, 1)) / 256 - 0.5
-            im = np.ascontiguousarray(im)
+        # the model has 3 nn.MaxPool2d(stride=2) layers
+        stride = 2 ** 3
 
-            data = torch.from_numpy(im).float()
-            if torch.cuda.is_available():
-                data = data.cuda()
-            # data = data.permute([2, 0, 1]).unsqueeze(0).float()
-            with torch.no_grad():
-                Mconv7_stage6_L1, Mconv7_stage6_L2 = self.model(data)
-            Mconv7_stage6_L1 = Mconv7_stage6_L1.cpu().numpy()
-            Mconv7_stage6_L2 = Mconv7_stage6_L2.cpu().numpy()
+        n_channel = util.n_limb*2 + util.n_keypoint + 1
+        out6_mean = torch.zeros((B, n_channel, H0, W0), dtype=torch.float32, device=img0.device)
+        n_scale = len(scales)
+        for scale in scales:
+            # scale
+            H1 = int(scale * 368)
+            W1 = int(H1 / H0 * W0)
+            img1 = TF.resize(img0, (H1, W1), interpolation=T.InterpolationMode.BICUBIC)
+            # pad
+            img2 = torch.nn.functional.pad(img1, (0, -W1%stride, 0, -H1%stride), value=0.5)
+            H2, W2 = img2.shape[-2:]
+            # main model
+            out6 = self.model(img2) # shape=(B, n_channel, H2/stride, W2/stride)
+            # undo nn.MaxPool2d downsampling
+            out6 = TF.resize(out6, (H2, W2), interpolation=T.InterpolationMode.BICUBIC)
+            # unpad
+            out6 = out6[:, :, :H1, :W1]
+            # undo scale
+            out6 = TF.resize(out6, (H0, W0), interpolation=T.InterpolationMode.BICUBIC)
+            out6_mean += out6
+        out6_mean /= n_scale
+        paf = out6[:, :util.n_limb*2]
+        heatmap = out6[:, util.n_limb*2:-1]
+        # the last heatmap channel is background, not used here
+        # https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/80d4c5f7b25ba4c3bf5745ab7d0e6ccd3db8b242/src/openpose/pose/poseParameters.cpp#L54
+        return paf, heatmap
 
-            # extract outputs, resize, and remove padding
-            # heatmap = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[1]].data), (1, 2, 0))  # output 1 is heatmaps
-            heatmap = np.transpose(np.squeeze(Mconv7_stage6_L2), (1, 2, 0))  # output 1 is heatmaps
-            heatmap = cv2.resize(heatmap, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
-            heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-            heatmap = cv2.resize(heatmap, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
+    def __call__(self, img, sigma=3.0, thre1=0.1, n_linspace=10, thre2=0.05):
 
-            # paf = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[0]].data), (1, 2, 0))  # output 0 is PAFs
-            paf = np.transpose(np.squeeze(Mconv7_stage6_L1), (1, 2, 0))  # output 0 is PAFs
-            paf = cv2.resize(paf, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
-            paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-            paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
+        ## check shape
+        H, W, C = img.shape
+        assert C == 3, C
 
-            heatmap_avg += heatmap_avg + heatmap / len(multiplier)
-            paf_avg += + paf / len(multiplier)
+        ## convert to tensor
+        img = torch.tensor(img.copy(), dtype=torch.float32, device=device) / 255 - 0.5
+        img = img.moveaxis(-1, 0)[None, :, :, :]
 
-        all_peaks = []
+        ## tensor operations
+        with torch.no_grad():
+            paf, heatmap = self.infer(img)
+            heatmap_blur = TF.gaussian_blur(heatmap,
+                kernel_size=int(np.ceil(sigma * 4)) * 2 + 1,
+                sigma=sigma)
+
+        ## convert to ndarray
+        paf          = paf         .detach().cpu().numpy()[0] # shape=(n_limb*2, H, W)
+        heatmap      = heatmap     .detach().cpu().numpy()[0] # shape=(n_keypoint, H, W)
+        heatmap_blur = heatmap_blur.detach().cpu().numpy()[0] # shape=(n_keypoint, H, W)
+
+        ## find peaks for each keypoint
+        all_peaks = [] # all_peaks[k][p] = (x, y, score, peak_id)
         peak_counter = 0
+        for k in range(util.n_keypoint):
+            map_blur = heatmap_blur[k]
+            map_blur_pad = np.pad(map_blur, 1)
+            peaks_binary = np.logical_and.reduce((
+                map_blur > thre1,
+                map_blur >= map_blur_pad[1:-1, :-2], # left
+                map_blur >= map_blur_pad[1:-1, 2:],  # right
+                map_blur >= map_blur_pad[:-2, 1:-1], # top
+                map_blur >= map_blur_pad[2:, 1:-1],  # bottom
+            ))
+            peaks = []
+            for y, x in zip(*np.nonzero(peaks_binary)):
+                score = heatmap[k, y, x]
+                peak_id = peak_counter
+                peak_counter += 1
+                peaks.append((x, y, score, peak_id))
+            all_peaks.append(peaks)
 
-        for part in range(18):
-            map_ori = heatmap_avg[:, :, part]
-            one_heatmap = gaussian_filter(map_ori, sigma=3)
+        ## find connections for each limb
+        all_connections = [] # all_connections[l][c] = (peak_id0, peak_id1, paf_score)
+        for l in range(util.n_limb):
+            k0, k1 = util.l2k[l]
+            peaks0, peaks1 = all_peaks[k0], all_peaks[k1]
+            max_n_connection = min(len(peaks0), len(peaks1))
+            if len(peaks0) == 0 or len(peaks1) == 0:
+                all_connections.append(np.array([]))
+                continue
+            paf_x, paf_y  = paf[util.l2m[l]]
+            connections_cand = []
+            for x0, y0, score0, peak_id0 in peaks0:
+                for x1, y1, score1, peak_id1 in peaks1:
+                    samp_x = np.linspace(x0, x1, n_linspace).round().astype(int)
+                    samp_y = np.linspace(y0, y1, n_linspace).round().astype(int)
+                    vec = np.array((x1-x0, y1-y0), dtype=np.float32)
+                    vec_norm = max(0.001, (vec ** 2).sum() ** 0.5)
+                    vec /= vec_norm
+                    paf_vec = paf_x[samp_y, samp_x] * vec[0] \
+                            + paf_y[samp_y, samp_x] * vec[1]
+                    dist_prior = min(0.5 * H / vec_norm - 1, 0)
+                    paf_score = paf_vec.mean() + dist_prior
+                    if (paf_vec > thre2).mean() > 0.8 and paf_score > 0:
+                        connections_cand.append((peak_id0, peak_id1, paf_score))
+            connections_cand.sort(key=lambda conn: conn[2], reverse=True)
 
-            map_left = np.zeros(one_heatmap.shape)
-            map_left[1:, :] = one_heatmap[:-1, :]
-            map_right = np.zeros(one_heatmap.shape)
-            map_right[:-1, :] = one_heatmap[1:, :]
-            map_up = np.zeros(one_heatmap.shape)
-            map_up[:, 1:] = one_heatmap[:, :-1]
-            map_down = np.zeros(one_heatmap.shape)
-            map_down[:, :-1] = one_heatmap[:, 1:]
+            peak_id_used = set()
+            connections = []
+            for connection in connections_cand:
+                peak_id0, peak_id1 = connection[:2]
+                if peak_id0 in peak_id_used or peak_id1 in peak_id_used:
+                    continue
+                connections.append(connection)
+                peak_id_used.add(peak_id0)
+                peak_id_used.add(peak_id1)
+                if len(connections) >= max_n_connection:
+                    break
+            all_connections.append(np.array(connections))
 
-            peaks_binary = np.logical_and.reduce(
-                (one_heatmap >= map_left, one_heatmap >= map_right, one_heatmap >= map_up, one_heatmap >= map_down, one_heatmap > thre1))
-            peaks = list(zip(np.nonzero(peaks_binary)[1], np.nonzero(peaks_binary)[0]))  # note reverse
-            peaks_with_score = [x + (map_ori[x[1], x[0]],) for x in peaks]
-            peak_id = range(peak_counter, peak_counter + len(peaks))
-            peaks_with_score_and_id = [peaks_with_score[i] + (peak_id[i],) for i in range(len(peak_id))]
+        ## collect list of all peaks
+        # peak_list: shape=(n_peak, 4)
+        # peak_list[peak_id] = x, y, score, peak_id
+        peak_list = []
+        for peaks in all_peaks:
+            peak_list += peaks
+        peak_list = np.array(peak_list, dtype=np.float32)
 
-            all_peaks.append(peaks_with_score_and_id)
-            peak_counter += len(peaks)
+        ## cluster connections into persons
+        # persons: shape=(n_person, n_keypoint+2)
+        # persons[p][:-2] are the peak_id of each keypoint, -1 if not present
+        # persons[p][-2] is the sum of (1) score of the keypoints and (2) paf_score of the limbs
+        # persons[p][-1] is the number of keypoints
+        persons = []
+        for l, connections in enumerate(all_connections):
+            if len(connections) == 0:
+                continue
+            k0, k1 = util.l2k[l]
+            for peak_id0, peak_id1, paf_score in connections:
+                peak_id0 = int(peak_id0)
+                peak_id1 = int(peak_id1)
 
-        # find connection in the specified sequence, center 29 is in the position 15
-        limbSeq = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], \
-                   [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], \
-                   [1, 16], [16, 18], [3, 17], [6, 18]]
-        # the middle joints heatmap correpondence
-        mapIdx = [[31, 32], [39, 40], [33, 34], [35, 36], [41, 42], [43, 44], [19, 20], [21, 22], \
-                  [23, 24], [25, 26], [27, 28], [29, 30], [47, 48], [49, 50], [53, 54], [51, 52], \
-                  [55, 56], [37, 38], [45, 46]]
+                # look for existing persons that is matched to either end of the current connection
+                person0 = None
+                person1 = None
+                for person in persons:
+                    if person0 is not None and person1 is not None:
+                        break
+                    if person[k0] == peak_id0:
+                        person0 = person
+                    if person[k1] == peak_id1:
+                        person1 = person
+                n_found = (person0 is not None) + (person1 is not None)
 
-        connection_all = []
-        special_k = []
-        mid_num = 10
+                # case (0): no matched, create a new person
+                if n_found == 0:
+                    if l < 17: # not considering shoulder-ear connections
+                        person = np.ones(20, dtype=np.float32) * -1
+                        person[k0] = peak_id0
+                        person[k1] = peak_id1
+                        person[-2] = paf_score + peak_list[peak_id0, 2] + peak_list[peak_id1, 2]
+                        person[-1] = 2
+                        persons.append(person)
 
-        for k in range(len(mapIdx)):
-            score_mid = paf_avg[:, :, [x - 19 for x in mapIdx[k]]]
-            candA = all_peaks[limbSeq[k][0] - 1]
-            candB = all_peaks[limbSeq[k][1] - 1]
-            nA = len(candA)
-            nB = len(candB)
-            indexA, indexB = limbSeq[k]
-            if (nA != 0 and nB != 0):
-                connection_candidate = []
-                for i in range(nA):
-                    for j in range(nB):
-                        vec = np.subtract(candB[j][:2], candA[i][:2])
-                        norm = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
-                        norm = max(0.001, norm)
-                        vec = np.divide(vec, norm)
+                # case (1): 1 end matched
+                elif n_found == 1:
+                    if person0 is not None:
+                        person0[k1] = peak_id1
+                        person0[-2] += paf_score + peak_list[peak_id1, 2]
+                        person0[-1] += 1
+                    if person1 is not None:
+                        person1[k0] = peak_id0
+                        person1[-2] += paf_score + peak_list[peak_id0, 2]
+                        person1[-1] += 1
 
-                        startend = list(zip(np.linspace(candA[i][0], candB[j][0], num=mid_num), \
-                                            np.linspace(candA[i][1], candB[j][1], num=mid_num)))
+                # case (2): 2 ends matched
+                else:
+                    # case (2.0): if they are the same person (loop), add paf_score
+                    if id(person0) == id(person1):
+                        person0[-2] += paf_score
+                    # case (2.1): if they are disjoint persons, merge them
+                    elif np.all(person0[:-2]==-1 | person1[:-2]==-1):
+                        person0 += person1
+                        person0[:-2] += 1
+                        person0[-2] += paf_score
+                        for p, person in enumerate(persons):
+                            if id(person) == id(person1):
+                                del persons[p]
+                                break
+                    # case (2.2): if they have one or more keypoints matched to different peaks, there's a conflict
+                    # attribute the current connection to the person with the higher score
+                    else:
+                        if person0[-2] >= person1[-2]:
+                            person0[k1] = peak_id1
+                            person0[-2] += paf_score + peak_list[peak_id1, 2]
+                            person0[-1] += 1
+                        else:
+                            person1[k0] = peak_id0
+                            person1[-2] += paf_score + peak_list[peak_id0, 2]
+                            person1[-1] += 1
 
-                        vec_x = np.array([score_mid[int(round(startend[I][1])), int(round(startend[I][0])), 0] \
-                                          for I in range(len(startend))])
-                        vec_y = np.array([score_mid[int(round(startend[I][1])), int(round(startend[I][0])), 1] \
-                                          for I in range(len(startend))])
+        ## delete the persons with few keypoints
+        to_delete = []
+        for p, person in enumerate(persons):
+            if person[-1] < 4 or person[-2] / person[-1] < 0.4:
+                to_delete.append(p)
+        for p in to_delete[::-1]:
+            del persons[p]
+        persons = np.array(persons, dtype=np.float32)
 
-                        score_midpts = np.multiply(vec_x, vec[0]) + np.multiply(vec_y, vec[1])
-                        score_with_dist_prior = sum(score_midpts) / len(score_midpts) + min(
-                            0.5 * oriImg.shape[0] / norm - 1, 0)
-                        criterion1 = len(np.nonzero(score_midpts > thre2)[0]) > 0.8 * len(score_midpts)
-                        criterion2 = score_with_dist_prior > 0
-                        if criterion1 and criterion2:
-                            connection_candidate.append(
-                                [i, j, score_with_dist_prior, score_with_dist_prior + candA[i][2] + candB[j][2]])
-
-                connection_candidate = sorted(connection_candidate, key=lambda x: x[2], reverse=True)
-                connection = np.zeros((0, 5))
-                for c in range(len(connection_candidate)):
-                    i, j, s = connection_candidate[c][0:3]
-                    if (i not in connection[:, 3] and j not in connection[:, 4]):
-                        connection = np.vstack([connection, [candA[i][3], candB[j][3], s, i, j]])
-                        if (len(connection) >= min(nA, nB)):
-                            break
-
-                connection_all.append(connection)
-            else:
-                special_k.append(k)
-                connection_all.append([])
-
-        # last number in each row is the total parts number of that person
-        # the second last number in each row is the score of the overall configuration
-        subset = -1 * np.ones((0, 20))
-        candidate = np.array([item for sublist in all_peaks for item in sublist])
-
-        for k in range(len(mapIdx)):
-            if k not in special_k:
-                partAs = connection_all[k][:, 0]
-                partBs = connection_all[k][:, 1]
-                indexA, indexB = np.array(limbSeq[k]) - 1
-
-                for i in range(len(connection_all[k])):  # = 1:size(temp,1)
-                    found = 0
-                    subset_idx = [-1, -1]
-                    for j in range(len(subset)):  # 1:size(subset,1):
-                        if subset[j][indexA] == partAs[i] or subset[j][indexB] == partBs[i]:
-                            subset_idx[found] = j
-                            found += 1
-
-                    if found == 1:
-                        j = subset_idx[0]
-                        if subset[j][indexB] != partBs[i]:
-                            subset[j][indexB] = partBs[i]
-                            subset[j][-1] += 1
-                            subset[j][-2] += candidate[partBs[i].astype(int), 2] + connection_all[k][i][2]
-                    elif found == 2:  # if found 2 and disjoint, merge them
-                        j1, j2 = subset_idx
-                        membership = ((subset[j1] >= 0).astype(int) + (subset[j2] >= 0).astype(int))[:-2]
-                        if len(np.nonzero(membership == 2)[0]) == 0:  # merge
-                            subset[j1][:-2] += (subset[j2][:-2] + 1)
-                            subset[j1][-2:] += subset[j2][-2:]
-                            subset[j1][-2] += connection_all[k][i][2]
-                            subset = np.delete(subset, j2, 0)
-                        else:  # as like found == 1
-                            subset[j1][indexB] = partBs[i]
-                            subset[j1][-1] += 1
-                            subset[j1][-2] += candidate[partBs[i].astype(int), 2] + connection_all[k][i][2]
-
-                    # if find no partA in the subset, create a new subset
-                    elif not found and k < 17:
-                        row = -1 * np.ones(20)
-                        row[indexA] = partAs[i]
-                        row[indexB] = partBs[i]
-                        row[-1] = 2
-                        row[-2] = sum(candidate[connection_all[k][i, :2].astype(int), 2]) + connection_all[k][i][2]
-                        subset = np.vstack([subset, row])
-        # delete some rows of subset which has few parts occur
-        deleteIdx = []
-        for i in range(len(subset)):
-            if subset[i][-1] < 4 or subset[i][-2] / subset[i][-1] < 0.4:
-                deleteIdx.append(i)
-        subset = np.delete(subset, deleteIdx, axis=0)
-
-        # subset: n*20 array, 0-17 is the index in candidate, 18 is the total score, 19 is the total parts
-        # candidate: x, y, score, id
-        return candidate, subset
-
-if __name__ == "__main__":
-    body_estimation = Body('../model/body_pose_model.pth')
-
-    test_image = '../images/ski.jpg'
-    oriImg = cv2.imread(test_image)  # B,G,R order
-    candidate, subset = body_estimation(oriImg)
-    canvas = util.draw_bodypose(oriImg[:, :, ::-1], candidate, subset)
-    plt.imshow(canvas)
-    plt.show()
+        return peak_list, persons

@@ -1,72 +1,73 @@
-import numpy as np
-import cv2
+import numpy as np, cv2
 
-def padRightDownCorner(img, stride, padValue):
-    h = img.shape[0]
-    w = img.shape[1]
+# 18 keypoints, zero-indexed
+keypoint_colors = [
+    [255,   0,   0],                                    # 0: nose
+    [255,  85,   0],                                    # 1: shoulder center, mean of 2 and 5
+    [255, 170,   0], [255, 255,   0], [170, 255,   0],  # 2-4: right arm
+    [ 85, 255,   0], [  0, 255,   0], [  0, 255,  85],  # 5-7: left arm
+    [  0, 255, 170], [  0, 255, 255], [  0, 170, 255],  # 8-10: right leg
+    [  0,  85, 255], [  0,   0, 255], [ 85,   0, 255],  # 11-13: left leg
+    [170,   0, 255], [255,   0, 255],                   # 14-15: right/left eyes
+    [255,   0, 170], [255,   0,  85],                   # 16-17: right/left ears
+]
+n_keypoint = len(keypoint_colors)
 
-    pad = 4 * [None]
-    pad[0] = 0 # up
-    pad[1] = 0 # left
-    pad[2] = 0 if (h % stride == 0) else stride - (h % stride) # down
-    pad[3] = 0 if (w % stride == 0) else stride - (w % stride) # right
+# limb index to keypoint index, zero-indexed
+l2k = np.array([
+                        [ 1,  2],   [ 1,  5],                       # right/left shoulders
+              [ 2,  3], [ 3,  4],   [ 5,  6], [ 6,  7],             # right/left arms
+    [ 1,  8], [ 8,  9], [ 9, 10],   [ 1, 11], [11, 12], [12, 13],   # right/left legs
+                              [ 1,  0],                             # neck
+              [ 0, 14], [14, 16],   [ 0, 15], [15, 17],             # right/left face
+                        [ 2, 16],   [ 5, 17]                        # right/left shoulder-ear connections
+])
+n_limb = len(l2k)
 
-    img_padded = img
-    pad_up = np.tile(img_padded[0:1, :, :]*0 + padValue, (pad[0], 1, 1))
-    img_padded = np.concatenate((pad_up, img_padded), axis=0)
-    pad_left = np.tile(img_padded[:, 0:1, :]*0 + padValue, (1, pad[1], 1))
-    img_padded = np.concatenate((pad_left, img_padded), axis=1)
-    pad_down = np.tile(img_padded[-2:-1, :, :]*0 + padValue, (pad[2], 1, 1))
-    img_padded = np.concatenate((img_padded, pad_down), axis=0)
-    pad_right = np.tile(img_padded[:, -2:-1, :]*0 + padValue, (1, pad[3], 1))
-    img_padded = np.concatenate((img_padded, pad_right), axis=1)
+# limb index to heatmap index, zero-indexed
+l2m = [
+                        [12, 13],   [20, 21],                       # right/left shoulders
+              [14, 15], [16, 17],   [22, 23], [24, 25],             # right/left arms
+    [ 0,  1], [ 2,  3], [ 4,  5],   [ 6,  7], [ 8,  9], [10, 11],   # right/left legs
+                              [28, 29],                             # neck
+              [30, 31], [34, 35],   [32, 33], [36, 37],             # right/left face
+                        [18, 19],   [26, 27],                       # right/left shoulder-ear connections
+]
 
-    return img_padded, pad
-
-# transfer caffe model to pytorch which will match the layer name
-def transfer(model, model_weights):
-    transfered_model_weights = {}
-    for weights_name in model.state_dict().keys():
-        transfered_model_weights[weights_name] = model_weights['.'.join(weights_name.split('.')[1:])]
-    return transfered_model_weights
-
-# draw the body keypoint and lims
-def draw_bodypose(canvas, candidate, subset):
+# draw the body keypoints and limbs
+def draw_bodypose(canvas, peak_list, persons):
     assert canvas.shape[2] == 3
-    canvas = canvas[:, :, ::-1].copy() # RGB -> BGR
-    stickwidth = 4
+    canvas = canvas[:, :, ::-1] # RGB -> BGR
+    persons = persons[:, :n_keypoint].astype(int) # using only the indices
 
-    limbSeq = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], \
-               [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], \
-               [1, 16], [16, 18], [3, 17], [6, 18]]
+    # draw limbs, using keypoint_colors[:n_limb-2]
+    canvas_tmp = canvas.copy()
+    for person in persons:
+        for l in range(n_limb-2): # not drawing the last 2 limbs
+            color = keypoint_colors[l][::-1] # BGR
+            k0, k1 = l2k[l]
+            index0, index1 = person[k0], person[k1]
+            if index0 != -1 and index1 != -1:
+                x0, y0 = peak_list[index0, :2]
+                x1, y1 = peak_list[index1, :2]
+                xm, ym = int((x0+x1)/2), int((y0+y1)/2)
+                xd, yd = x0-x1, y0-y1
+                length = int((xd ** 2 + yd ** 2) ** 0.5 / 2)
+                angle = int(np.degrees(np.arctan2(yd, xd)))
+                polygon = cv2.ellipse2Poly((xm, ym), (length, 4), angle, 0, 360, 1)
+                cv2.fillConvexPoly(canvas_tmp, polygon, color)
+    canvas = cv2.addWeighted(canvas, 0.4, canvas_tmp, 0.6, 0)
 
-    colors = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], \
-              [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], \
-              [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
-
-    for i in range(18):
-        for n in range(len(subset)):
-            index = int(subset[n][i])
-            if index == -1:
-                continue
-            x, y = candidate[index][0:2]
-            cv2.circle(canvas, (int(x), int(y)), 4, colors[i], thickness=-1)
-
-    for i in range(17):
-        for n in range(len(subset)):
-            index = subset[n][np.array(limbSeq[i]) - 1]
-            if -1 in index:
-                continue
-            cur_canvas = canvas.copy()
-            Y = candidate[index.astype(int), 0]
-            X = candidate[index.astype(int), 1]
-            mX = np.mean(X)
-            mY = np.mean(Y)
-            length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
-            angle = np.degrees(np.arctan2(X[0] - X[1], Y[0] - Y[1]))
-            polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
-            cv2.fillConvexPoly(cur_canvas, polygon, colors[i])
-            canvas = cv2.addWeighted(canvas, 0.4, cur_canvas, 0.6, 0)
+    # draw keypoints
+    canvas_tmp = canvas.copy()
+    for person in persons:
+        for k in range(n_keypoint):
+            color = keypoint_colors[k][::-1] # BGR
+            index = person[k]
+            if index != -1:
+                x, y = peak_list[index][0:2].astype(int)
+                cv2.circle(canvas_tmp, (x, y), 4, color, thickness=-1)
+    canvas = cv2.addWeighted(canvas, 0.4, canvas_tmp, 0.6, 0)
 
     canvas = canvas[:, :, ::-1] # BGR -> RGB
     return canvas
